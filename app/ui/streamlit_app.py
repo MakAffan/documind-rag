@@ -1,16 +1,26 @@
 import streamlit as st
-import requests
-
-API_URL = "http://127.0.0.1:8000"
+import os
+from app.embeddings.embedder import embed_text
+from app.vectorstore.store import VectorStore
+from app.rag.retriever import retrieve
+from app.rag.generator import generate_answer
+from app.config import CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID, LLM_MODEL, CLOUDFLARE_AI_BASE_URL, HEADERS
 
 st.set_page_config(page_title="DocuMind", layout="centered")
-
 st.title("📄 DocuMind – AI Document Q&A")
-
 st.markdown("Upload text and ask questions powered by Cloudflare RAG.")
 
 # -----------------------
-# Load document
+# Global in-memory vector store
+# -----------------------
+if "vector_store" not in st.session_state:
+    if os.path.exists("data/index.faiss"):
+        st.session_state.vector_store = VectorStore.load(dim=768)
+    else:
+        st.session_state.vector_store = None
+
+# -----------------------
+# Load Document
 # -----------------------
 st.header("1️⃣ Load Document")
 
@@ -23,43 +33,57 @@ if st.button("Load Document"):
     if not doc_text.strip():
         st.error("Document text cannot be empty")
     else:
-        with st.spinner("Loading document..."):
-            res = requests.post(
-                f"{API_URL}/load",
-                json={"text": doc_text},
-                timeout=60,
-            )
+        with st.spinner("Processing document..."):
+            try:
+                # Treat whole text as one chunk (for simplicity)
+                chunks = [doc_text]
 
-        if res.status_code == 200:
-            st.success("Document loaded successfully")
-        else:
-            st.error(res.text)
+                embeddings = embed_text(chunks)
+                store = VectorStore(len(embeddings[0]))
+                store.add(embeddings, chunks)
+                store.save()
+
+                st.session_state.vector_store = store
+                st.success(f"Document loaded successfully ({len(chunks)} chunks)")
+            except Exception as e:
+                st.error(f"Error loading document: {e}")
+
+if st.button("Clear Document"):
+    st.session_state.vector_store = None
+    if os.path.exists("data"):
+        import shutil
+        shutil.rmtree("data")
+    st.success("Document cleared")
 
 # -----------------------
-# Ask question
+# Ask Question
 # -----------------------
 st.header("2️⃣ Ask Question")
 
 question = st.text_input("Enter your question:")
 
 if st.button("Ask"):
-    if not question.strip():
+    store = st.session_state.vector_store
+    if store is None:
+        st.error("Please load a document first!")
+    elif not question.strip():
         st.error("Question cannot be empty")
     else:
-        with st.spinner("Thinking..."):
-            res = requests.post(
-                f"{API_URL}/ask",
-                json={"question": question, "top_k": 3},
-                timeout=60,
-            )
+        with st.spinner("Generating answer..."):
+            try:
+                # Retrieve top-k relevant chunks
+                docs = retrieve(question, store, k=3)
+                context = "\n".join([r[0] for r in results])
 
-        if res.status_code == 200:
-            data = res.json()
-            st.subheader("💡 Answer")
-            st.write(data["answer"])
+                # Generate answer using Cloudflare LLM
+                answer = generate_answer(context, question)
 
-            st.subheader("📚 Sources")
-            for src in data["sources"]:
-                st.markdown(f"- {src}")
-        else:
-            st.error(res.text)
+                # Display results
+                st.subheader("💡 Answer")
+                st.write(answer)
+
+                st.subheader("📚 Sources")
+                for text, score in results:
+                    st.markdown(f"- {text}  \n  _Similarity score: {score:.4f}_")
+            except Exception as e:
+                st.error(f"Error generating answer: {e}")
